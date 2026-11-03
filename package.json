@@ -7,7 +7,9 @@
     "server"
   ],
   "scripts": {
-    "start": "npm run start:prod --workspace server",
+    "start": "node server/scripts/start-production.cjs",
+    "render:build": "npm ci --include=dev && npm run prisma:generate --workspace server && npm run build",
+    "test:deployment": "node server/test/deployment.cjs",
     "dev": "concurrently -n api,web -c green,cyan \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "npm run start:dev --workspace server",
     "dev:client": "npm run dev --workspace client",

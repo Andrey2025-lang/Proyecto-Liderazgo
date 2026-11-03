@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: jyc-digital
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm run render:build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    disk:
+      name: jyc-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: VITE_API_URL
+        value: /api
+      - key: DATA_DIR
+        value: /var/data
+      - key: DATABASE_URL
+        value: file:/var/data/jyc.db
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_NAME
+        value: Administración

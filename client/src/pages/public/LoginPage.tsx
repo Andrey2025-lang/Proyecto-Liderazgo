@@ -20,13 +20,13 @@ const schema = z.object({
 
 type FormValues = z.infer<typeof schema>
 
-const accessAccounts = [
+const accessAccounts = import.meta.env.DEV ? [
   { role: 'Cliente', email: 'cliente@jyc.cr', password: 'Cliente123!' },
   { role: 'Administrador', email: 'admin@jyc.cr', password: 'Staff123!' },
   { role: 'Supervisor', email: 'supervisor@jyc.cr', password: 'Staff123!' },
   { role: 'Oficinista', email: 'oficinista@jyc.cr', password: 'Staff123!' },
   { role: 'Cobrador', email: 'cobrador@jyc.cr', password: 'Staff123!' },
-]
+] : []
 
 export function LoginPage() {
   const { user, loading, login, homeForRole } = useAuth()
@@ -165,7 +165,7 @@ export function LoginPage() {
             </Link>
           </p>
 
-          <div className="mt-8 rounded-3xl border border-forest-900/10 bg-white p-4">
+          {import.meta.env.DEV && <div className="mt-8 rounded-3xl border border-forest-900/10 bg-white p-4">
             <p className="text-xs font-bold uppercase tracking-[0.18em] text-forest-600">
               Accesos rápidos
             </p>
@@ -186,7 +186,7 @@ export function LoginPage() {
               ))}
             </div>
             <p className="mt-2 text-[11px] text-ink/40">Tocá una cuenta para completar el formulario.</p>
-          </div>
+          </div>}
         </div>
       </main>
     </div>

@@ -251,17 +251,56 @@ npm run db:seed    # Cargar datos de ejemplo
 - La verificación de correo y el captcha quedan como mejoras pendientes; el modelo y el flujo están preparados para incorporarlos.
 - La identidad visual usa los logos entregados por la empresa: `client/public/prestamos-jyc-logo.png` para la marca horizontal y `client/public/prestamos-jyc-icon.png` para el emblema circular. Los teléfonos de contacto se administran desde la configuración interna.
 
-## Despliegue desde GitHub
+## Despliegue completo en Render
 
 El repositorio contiene el código y los archivos de ejemplo de configuración. No incluye la base de datos local, documentos adjuntos, contraseñas del entorno ni dependencias instaladas.
 
-- Instalación y compilación desde la raíz: `npm ci`, `npm run prisma:generate --workspace server`, `npm run build`.
-- API: ejecutar `npm start` y definir `NODE_ENV=production`, `PORT`, `DATABASE_URL`, `JWT_SECRET`, `CLIENT_ORIGIN` y `UPLOAD_DIR` en la plataforma de alojamiento.
-- Frontend: publicar `client/dist` con fallback de rutas a `index.html`. Redirigir `/api` a la API. Si se usa otra dirección pública, definir `VITE_API_URL` antes de compilar y configurar CORS y cookies para esa arquitectura.
-- SQLite y los adjuntos necesitan almacenamiento persistente. Usar rutas absolutas, por ejemplo `DATABASE_URL=file:/data/jyc.db` y `UPLOAD_DIR=/data/uploads`, con una única instancia de API.
-- Sincronizar el esquema con `npm run db:push` contra la base del despliegue, después iniciar la API para crear también el índice de solicitudes únicas.
-- **No ejecutar `db:seed` en una base con información que deba conservarse:** elimina y recrea los datos. Las cuentas iniciales y los accesos rápidos incluidos en el código usan credenciales conocidas; no deben habilitarse en una instalación pública con datos reales. Configurar cuentas propias antes de abrir el acceso.
-- La plataforma concreta de despliegue se configura por separado. GitHub por sí solo no ejecuta la API ni proporciona persistencia SQLite.
+Una sola instancia Node sirve React y la API bajo la misma URL HTTPS. No se necesita Netlify ni un segundo servicio. `npm start` prepara las carpetas, crea las tablas sin autorizar borrados, crea el primer administrador si falta y luego inicia el servidor. Nunca ejecuta `db:seed` ni modifica las contraseñas existentes. Los accesos rápidos de desarrollo no se incluyen en la página de producción.
+
+### Opción automática: Blueprint
+
+En Render: **New → Blueprint → conectar este repositorio → main**. Render lee `render.yaml`. Introducir únicamente `ADMIN_EMAIL` y `ADMIN_PASSWORD` (propia, al menos 12 caracteres). Se genera `JWT_SECRET` automáticamente y se configura el disco y el resto de las variables.
+
+**La plantilla solicita un servicio Starter de pago y un disco persistente de 1 GB. Revisar y aceptar los cargos en Render antes de crear el servicio.** Este repositorio no crea servicios ni contrata planes automáticamente. Si ya existe un Web Service, es preferible configurarlo como se indica abajo para evitar duplicarlo y pagar dos servicios.
+
+### Actualizar el Web Service existente
+
+| Campo de Render | Valor |
+| --- | --- |
+| Branch | `main` |
+| Root Directory | vacío |
+| Build Command | `npm run render:build` |
+| Start Command | `npm start` |
+| Health Check Path | `/api/health` |
+| Disco persistente (Mount Path) | `/var/data` |
+
+En **Environment** configurar:
+
+| Variable | Valor |
+| --- | --- |
+| `NODE_VERSION` | `22` |
+| `NODE_ENV` | `production` |
+| `VITE_API_URL` | `/api` (si existe un valor anterior, reemplazarlo) |
+| `DATA_DIR` | `/var/data` |
+| `DATABASE_URL` | `file:/var/data/jyc.db` |
+| `UPLOAD_DIR` | `/var/data/uploads` |
+| `JWT_SECRET` | generar una clave privada aleatoria de al menos 32 caracteres |
+| `ADMIN_EMAIL` | correo propio para iniciar sesión |
+| `ADMIN_PASSWORD` | contraseña propia de al menos 12 caracteres |
+
+No poner comillas alrededor de los valores. Render asigna `PORT` automáticamente. `CLIENT_ORIGIN` es opcional para este despliegue de un solo origen: puede quitarse el valor localhost anterior; el servidor usa `RENDER_EXTERNAL_URL` automáticamente.
+
+Guardar y ejecutar **Manual Deploy → Deploy latest commit**. Abrir la URL principal para ver el sitio; `/api/health` verifica el backend. Los enlaces directos como `/login` o `/app/prestamos` funcionan sin errores 404. Ingresar con las credenciales propias de administrador; desde Usuarios se pueden crear cuentas internas. No hay datos ni usuarios de ejemplo en la base nueva.
+
+Después del primer inicio correcto, se puede retirar `ADMIN_PASSWORD` de Environment. Cambiar esa variable después no cambia una cuenta ya creada. No borrar ni reemplazar el disco: contiene SQLite y las cédulas adjuntas. Mantener una única instancia y realizar copias de seguridad del disco.
+
+### Validación antes de publicar
+
+`npm run build` y `npm run test:integration --workspace server` verifican el código. `npm run test:deployment` prueba además el inicio completo en una base temporal: sitio React, rutas directas, API, creación del administrador, cookies seguras y conservación de la cuenta al reiniciar. No utiliza la base local.
+
+No ejecutar `db:seed` ni `setup` contra una instalación que deba conservarse: cargan datos de ejemplo y eliminan los existentes. La actualización de esquema al iniciar no usa `--accept-data-loss` ni `--force-reset`; si un cambio requiere migración manual, el inicio se detiene con un mensaje.
+
+GitHub Pages no puede ejecutar Node ni alojar esta base. El repositorio solo contiene código; los datos y secretos permanecen en Render. Antes de abrir acceso con información real, revisar vulnerabilidades de dependencias, respaldos y controles de privacidad.
 
 ## Limitaciones conocidas
 
