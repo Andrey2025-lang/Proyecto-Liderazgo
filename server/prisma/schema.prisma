@@ -1,0 +1,222 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  name            String
+  phone           String?
+  role            String    @default("CLIENT")
+  status          String    @default("ACTIVE")
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  profile              ClientProfile?
+  applications         LoanApplication[] @relation("ClientApplications")
+  reviewedApplications LoanApplication[] @relation("ReviewedApplications")
+  clientLoans          Loan[]            @relation("ClientLoans")
+  collectorLoans       Loan[]            @relation("LoanCollector")
+  assignedClients      ClientProfile[]   @relation("CollectorAssignments")
+  paymentsCollected    Payment[]         @relation("PaymentCollector")
+  paymentsCreated      Payment[]         @relation("PaymentCreator")
+  paymentsVoided       Payment[]         @relation("PaymentVoider")
+  auditLogs            AuditLog[]
+  notifications        Notification[]
+  consents             Consent[]
+}
+
+model ClientProfile {
+  id                  String    @id @default(cuid())
+  userId              String    @unique
+  cedula              String    @unique
+  birthDate           DateTime?
+  address             String?
+  community           String?
+  occupation          String?
+  employer            String?
+  employmentStartDate DateTime?
+  monthlyIncome       Float?
+  otherIncome         Float?
+  assignedCollectorId String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  user              User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedCollector User? @relation("CollectorAssignments", fields: [assignedCollectorId], references: [id])
+}
+
+model LoanApplication {
+  id                String    @id @default(cuid())
+  clientId          String
+  amountRequested   Float
+  termWeeks         Int       @default(8)
+  termInstallments  Int
+  paymentFrequency  String
+  purpose           String?
+  status            String    @default("DRAFT")
+  submittedAt       DateTime?
+  reviewedById      String?
+  reviewNotes       String?
+  decisionAt        DateTime?
+  rejectionReason   String?
+  approvedAmount    Float?
+  annualRate        Float?
+  approvedTermWeeks Int?
+  approvedTerm      Int?
+  approvedFrequency String?
+  firstDueDate      DateTime?
+  renewalOfLoanId   String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  client     User                  @relation("ClientApplications", fields: [clientId], references: [id], onDelete: Cascade)
+  reviewedBy User?                 @relation("ReviewedApplications", fields: [reviewedById], references: [id])
+  documents  ApplicationDocument[]
+  loan       Loan?
+  renewalOfLoan Loan? @relation("RenewalSource", fields: [renewalOfLoanId], references: [id])
+}
+
+model ApplicationDocument {
+  id            String   @id @default(cuid())
+  applicationId String
+  type          String
+  originalName  String
+  storedName    String
+  mimeType      String
+  size          Int
+  createdAt     DateTime @default(now())
+
+  application LoanApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+model Loan {
+  id                   String    @id @default(cuid())
+  applicationId        String    @unique
+  clientId             String
+  principal            Float
+  annualRate           Float
+  termWeeks             Int       @default(8)
+  termInstallments     Int
+  paymentFrequency     String
+  startDate            DateTime
+  firstDueDate         DateTime
+  status               String    @default("PENDING_DISBURSEMENT")
+  disbursedAt          DateTime?
+  renewalPayoff        Float     @default(0)
+  netDisbursement      Float?
+  listoRecaudoLoanId   String?
+  assignedCollectorId  String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  application       LoanApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  client            User            @relation("ClientLoans", fields: [clientId], references: [id])
+  assignedCollector User?           @relation("LoanCollector", fields: [assignedCollectorId], references: [id])
+  installments      Installment[]
+  payments          Payment[]
+  renewalApplications LoanApplication[] @relation("RenewalSource")
+  settlementPayment Payment? @relation("RenewalSettlement")
+}
+
+model Installment {
+  id         String   @id @default(cuid())
+  loanId     String
+  number     Int
+  dueDate    DateTime
+  principal  Float
+  interest   Float
+  total      Float
+  paidAmount Float    @default(0)
+  status     String   @default("PENDING")
+
+  loan        Loan                @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  allocations PaymentAllocation[]
+
+  @@unique([loanId, number])
+}
+
+model Payment {
+  id                  String    @id @default(cuid())
+  loanId              String
+  amount              Float
+  paidAt              DateTime
+  method              String    @default("CASH")
+  receiptNumber       String    @unique
+  listoRecaudoReceipt String?
+  notes               String?
+  collectorId         String?
+  createdById         String?
+  voidedAt            DateTime?
+  voidedById          String?
+  voidReason          String?
+  refinancingLoanId   String?   @unique
+  createdAt           DateTime  @default(now())
+
+  loan        Loan                @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  collector   User?               @relation("PaymentCollector", fields: [collectorId], references: [id])
+  createdBy   User?               @relation("PaymentCreator", fields: [createdById], references: [id])
+  voidedBy    User?               @relation("PaymentVoider", fields: [voidedById], references: [id])
+  allocations PaymentAllocation[]
+  refinancingLoan Loan? @relation("RenewalSettlement", fields: [refinancingLoanId], references: [id])
+}
+
+model PaymentAllocation {
+  id            String @id @default(cuid())
+  paymentId     String
+  installmentId String
+  amount        Float
+
+  payment     Payment     @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  installment Installment @relation(fields: [installmentId], references: [id], onDelete: Cascade)
+}
+
+model Consent {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  version   String
+  acceptedAt DateTime @default(now())
+  ipAddress String?
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type, version])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

@@ -1,0 +1,191 @@
+import 'reflect-metadata';
+import { strict as assert } from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { NestFactory } from '@nestjs/core';
+import { ValidationPipe } from '@nestjs/common';
+import cookieParser from 'cookie-parser';
+import request from 'supertest';
+import * as bcrypt from 'bcryptjs';
+import { AppModule } from '../src/app.module';
+import { PrismaService } from '../src/prisma/prisma.service';
+import { SanitizeInterceptor } from '../src/common/interceptors/sanitize.interceptor';
+import { calculateSchedule } from '../src/loans/loan-calculator';
+import { Workbook } from 'exceljs';
+import { parseBusinessDate } from '../src/common/dates';
+
+async function main() {
+  assert.equal(parseBusinessDate('2026-11-02').toISOString(), '2026-11-02T06:00:00.000Z');
+  assert.equal(parseBusinessDate('2026-11-02T18:30:00Z').toISOString(), '2026-11-02T18:30:00.000Z');
+  const base = join(process.env.LOCALAPPDATA || process.cwd(), 'Temp', 'opencode');
+  mkdirSync(base, { recursive: true });
+  const directory = mkdtempSync(join(base, 'jyc-test-'));
+  process.env.DATABASE_URL = `file:${join(directory, 'test.db').replace(/\\/g, '/')}`;
+  process.env.JWT_SECRET = 'isolated-prototype-test-secret';
+  let app: Awaited<ReturnType<typeof NestFactory.create>> | undefined;
+  try {
+    execFileSync(process.execPath, [require.resolve('prisma/build/index.js'), 'db', 'push', '--skip-generate', '--schema', resolve('prisma/schema.prisma')], { env: process.env, stdio: 'pipe' });
+    app = await NestFactory.create(AppModule, { logger: false });
+    app.setGlobalPrefix('api');
+    app.use(cookieParser());
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    app.useGlobalInterceptors(new SanitizeInterceptor());
+    await app.init();
+    const prisma = app.get(PrismaService);
+    const passwordHash = await bcrypt.hash('Test123!', 4);
+    const admin = await prisma.user.create({ data: { email: 'admin@test.cr', name: 'Administrador', passwordHash, role: 'ADMIN' } });
+    await prisma.user.create({ data: { email: 'clerk@test.cr', name: 'Oficinista', passwordHash, role: 'CLERK' } });
+    const client = await prisma.user.create({ data: { email: 'client@test.cr', name: 'Cliente Prueba', passwordHash, role: 'CLIENT', profile: { create: { cedula: '1-1111-1111' } } } });
+    const outsider = await prisma.user.create({ data: { email: 'other@test.cr', name: 'Otro Cliente', passwordHash, role: 'CLIENT', profile: { create: { cedula: '1-2222-2222' } } } });
+    const api = request(app.getHttpServer());
+    async function login(email: string) {
+      const response = await api.post('/api/auth/login').send({ email, password: 'Test123!' }).expect(200);
+      return response.headers['set-cookie'][0].split(';')[0];
+    }
+    const adminCookie = await login(admin.email);
+    const clerkCookie = await login('clerk@test.cr');
+    const clientCookie = await login(client.email);
+    const outsiderCookie = await login(outsider.email);
+    const product = { amountRequested: 100000, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', name: client.name, phone: '88888888', cedula: '1-1111-1111', acceptPrivacy: true, acceptEquifax: true, saveAsDraft: true };
+    async function submitIdentity(id: string, cookie: string, concurrent = false) {
+      await prisma.applicationDocument.create({ data: { applicationId: id, type: 'ID_CARD', originalName: 'cedula.png', storedName: 'test-cedula.png', mimeType: 'image/png', size: 10 } });
+      if (concurrent) {
+        const results = await Promise.all([1, 2].map(() => api.post(`/api/applications/${id}/submit`).set('Cookie', cookie)));
+        assert.equal(results.filter((response) => response.status === 201).length, 1, 'Solo un envío simultáneo debe completarse');
+        assert.ok(results.every((response) => [201, 400, 409].includes(response.status)));
+      } else {
+        await api.post(`/api/applications/${id}/submit`).set('Cookie', cookie).expect(201);
+      }
+    }
+    const approval = { approvedAmount: 100000, annualRate: 5, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', firstDueDate: new Date(Date.now() + 7 * 86400000).toISOString() };
+    const sourceApplication = await prisma.loanApplication.create({ data: { clientId: client.id, amountRequested: 100000, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', status: 'APPROVED' } });
+    const schedule = calculateSchedule(100000, 5, 8, 'WEEKLY', new Date(Date.now() + 7 * 86400000));
+    const source = await prisma.loan.create({ data: { clientId: client.id, applicationId: sourceApplication.id, principal: 100000, annualRate: 5, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', startDate: new Date(), firstDueDate: schedule[0].dueDate, disbursedAt: new Date(), status: 'ACTIVE', installments: { create: schedule } } });
+    assert.equal((await api.get('/api/public/settings').expect(200)).body.annualRate, 5);
+    await api.post('/api/applications').set('Cookie', clientCookie).send(product).expect(409);
+    await api.post('/api/applications').set('Cookie', clientCookie).send({ ...product, renewalOfLoanId: source.id }).expect(400);
+    const paymentDay = new Date(Date.now() - 6 * 3600000).toISOString().slice(0, 10);
+    await api.post(`/api/loans/${source.id}/payments`).set('Cookie', adminCookie).send({ amount: 80000, method: 'CASH', paidAt: paymentDay }).expect(201);
+    const datedPayment = await prisma.payment.findFirstOrThrow({ where: { loanId: source.id, method: 'CASH' } });
+    assert.equal(datedPayment.paidAt.toISOString(), `${paymentDay}T06:00:00.000Z`, 'Una fecha de pago sin hora debe interpretarse en Costa Rica');
+    await api.post('/api/applications').set('Cookie', outsiderCookie).send({ ...product, cedula: '1-2222-2222', renewalOfLoanId: source.id }).expect(400);
+    await api.post('/api/applications').set('Cookie', clientCookie).send({ ...product, termInstallments: 1 }).expect(400);
+    const renewal = (await api.post('/api/applications').set('Cookie', clientCookie).send({ ...product, renewalOfLoanId: source.id }).expect(201)).body;
+    await api.post(`/api/applications/${renewal.id}/submit`).set('Cookie', clientCookie).expect(400);
+    await api.patch(`/api/applications/${renewal.id}`).set('Cookie', clientCookie).send({ saveAsDraft: false }).expect(400);
+    await api.post(`/api/applications/${renewal.id}/documents`).set('Cookie', clientCookie).field('type', 'INCOME_PROOF').attach('file', Buffer.from('not needed'), { filename: 'income.png', contentType: 'image/png' }).expect(400);
+    await submitIdentity(renewal.id, clientCookie, true);
+    await api.post(`/api/applications/${renewal.id}/submit`).set('Cookie', clientCookie).expect(400);
+    await api.post('/api/applications').set('Cookie', clientCookie).send({ ...product, renewalOfLoanId: source.id }).expect(409);
+    await api.post(`/api/applications/${renewal.id}/approve`).set('Cookie', clerkCookie).send(approval).expect(403);
+    await api.put('/api/settings').set('Cookie', clerkCookie).send({ annualRate: '50' }).expect(403);
+    const approved = (await api.post(`/api/applications/${renewal.id}/approve`).set('Cookie', adminCookie).send(approval).expect(201)).body;
+    assert.equal(approved.renewalPayoff, 25000);
+    assert.equal(approved.netDisbursement, 75000);
+    assert.equal((await prisma.loan.findUniqueOrThrow({ where: { id: source.id } })).status, 'ACTIVE');
+    await api.post(`/api/loans/${approved.id}/disburse`).set('Cookie', clerkCookie).send({}).expect(403);
+    await api.post(`/api/loans/${approved.id}/disburse`).set('Cookie', adminCookie).send({ expectedRenewalPayoff: 24000 }).expect(400);
+    assert.equal(await prisma.payment.count({ where: { method: 'REFINANCE' } }), 0);
+    const disbursed = (await api.post(`/api/loans/${approved.id}/disburse`).set('Cookie', adminCookie).send({ expectedRenewalPayoff: 25000 }).expect(201)).body;
+    assert.equal(disbursed.netDisbursement, 75000);
+    assert.equal(disbursed.installments.reduce((sum: number, item: { total: number }) => sum + item.total, 0), 105000);
+    const closed = (await api.get(`/api/loans/me/${source.id}`).set('Cookie', clientCookie).expect(200)).body;
+    assert.equal(closed.balance, 0);
+    assert.equal(closed.status, 'REFINANCED');
+    await api.post(`/api/loans/${approved.id}/disburse`).set('Cookie', adminCookie).send({ expectedRenewalPayoff: 25000 }).expect(400);
+    assert.equal(await prisma.payment.count({ where: { method: 'REFINANCE' } }), 1);
+    const settlement = await prisma.payment.findFirstOrThrow({ where: { method: 'REFINANCE' } });
+    await api.post(`/api/payments/${settlement.id}/void`).set('Cookie', adminCookie).send({ reason: 'No permitido' }).expect(400);
+    const dashboard = (await api.get('/api/reports/dashboard').set('Cookie', adminCookie).expect(200)).body;
+    assert.equal(dashboard.kpis.collectedMonth, 80000, 'La renovación no debe sumarse a los cobros');
+    const recentDue = await prisma.installment.findFirstOrThrow({ where: { loanId: approved.id }, orderBy: { number: 'asc' } });
+    await prisma.installment.update({ where: { id: recentDue.id }, data: { dueDate: new Date(Date.now() - 3600000) } });
+    const overdueDashboard = (await api.get('/api/reports/dashboard').set('Cookie', adminCookie).expect(200)).body;
+    assert.equal(overdueDashboard.aging.reduce((sum: number, row: { amount: number }) => sum + row.amount, 0), overdueDashboard.kpis.overdueAmount, 'Los rangos deben incluir vencimientos de menos de 24 horas');
+    assert.equal(overdueDashboard.aging.reduce((sum: number, row: { count: number }) => sum + row.count, 0), overdueDashboard.kpis.overdueCount);
+    await prisma.installment.update({ where: { id: recentDue.id }, data: { dueDate: recentDue.dueDate, status: recentDue.status } });
+    await api.put('/api/settings').set('Cookie', adminCookie).send({ loanAmounts: '100000,200000', annualRate: '5', minTerm: '2', maxTerm: '12' }).expect(200);
+    const simulation = (await api.post('/api/public/simulate').send({ amount: 200000, termWeeks: 12, termInstallments: 12, paymentFrequency: 'WEEKLY' }).expect(201)).body;
+    assert.equal(simulation.totalInterest, 10000);
+    await api.post('/api/public/simulate').send({ amount: 50000, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY' }).expect(400);
+    const monthlySimulation = (await api.post('/api/public/simulate').send({ amount: 100000, termWeeks: 12, termInstallments: 3, paymentFrequency: 'MONTHLY' }).expect(201)).body;
+    assert.equal(monthlySimulation.installments, 3, '12 semanas mensuales son 3 cuotas');
+    await api.post('/api/public/simulate').send({ amount: 100000, termWeeks: 3, termInstallments: 1, paymentFrequency: 'MONTHLY' }).expect(400);
+    await api.post('/api/public/simulate').send({ amount: 100000, termWeeks: 10, termInstallments: 3, paymentFrequency: 'MONTHLY' }).expect(400);
+    await api.post('/api/public/simulate').send({ amount: 100000, termWeeks: 7, termInstallments: 4, paymentFrequency: 'BIWEEKLY' }).expect(400);
+    const biweeklySimulation = (await api.post('/api/public/simulate').send({ amount: 100000, termWeeks: 6, termInstallments: 3, paymentFrequency: 'BIWEEKLY' }).expect(201)).body;
+    assert.equal(biweeklySimulation.installments, 3, '6 semanas quincenales son 3 cuotas');
+    await api.put('/api/settings').set('Cookie', adminCookie).send({ loanAmounts: 'NaN', minTerm: '12', maxTerm: '1' }).expect(400);
+    assert.deepEqual((await api.get('/api/public/settings').expect(200)).body.loanAmounts, [100000, 200000]);
+    assert.equal((await prisma.loan.findUniqueOrThrow({ where: { id: approved.id } })).annualRate, 5);
+    const assistedClient = (await api.post('/api/clients').set('Cookie', clerkCookie).send({ name: 'Cliente Asistido', email: 'assisted@test.cr', phone: '88888888', cedula: '1-3333-3333', password: 'Test123!', community: 'San Pablo de Nandayure', occupation: 'Técnico en refrigeración', acceptPrivacy: true }).expect(201)).body;
+    assert.equal(assistedClient.role, 'CLIENT');
+    assert.equal(assistedClient.profile.community, 'San Pablo de Nandayure');
+    assert.equal(assistedClient.profile.occupation, 'Técnico en refrigeración');
+    await api.post('/api/clients').set('Cookie', clerkCookie).send({ name: 'Zona inválida', email: 'invalid-zone@test.cr', cedula: '1-4444-4444', password: 'Test123!', community: 'Otra zona', acceptPrivacy: true }).expect(400);
+    await api.post('/api/applications/assisted').set('Cookie', clerkCookie).send({ ...product, clientId: assistedClient.id, cedula: '1-3333-3333', name: assistedClient.name }).expect(201);
+    await api.post('/api/applications/assisted').set('Cookie', clerkCookie).send({ ...product, clientId: assistedClient.id, cedula: '1-3333-3333', name: assistedClient.name }).expect(409);
+    await api.post('/api/applications/assisted').set('Cookie', clerkCookie).send({ ...product, clientId: client.id }).expect(409);
+    const raceClient = await prisma.user.create({ data: { name: 'Solicitudes simultáneas', email: 'race@test.cr', passwordHash, role: 'CLIENT', profile: { create: { cedula: '1-5555-5555' } } } });
+    const simultaneous = await Promise.all([1, 2].map(() => api.post('/api/applications/assisted').set('Cookie', clerkCookie).send({ ...product, clientId: raceClient.id, cedula: '1-5555-5555', name: raceClient.name })));
+    assert.deepEqual(simultaneous.map((response) => response.status).sort(), [201, 409], 'Dos solicitudes simultáneas deben dejar solo una pendiente');
+    assert.equal(await prisma.loanApplication.count({ where: { clientId: raceClient.id } }), 1);
+    // Renovar un crédito ya pagado entrega el monto completo y no crea cobros duplicados.
+    const paidApplication = await prisma.loanApplication.create({ data: { clientId: outsider.id, amountRequested: 100000, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', status: 'APPROVED' } });
+    const paidLoan = await prisma.loan.create({ data: { clientId: outsider.id, applicationId: paidApplication.id, principal: 100000, annualRate: 5, termWeeks: 8, termInstallments: 8, paymentFrequency: 'WEEKLY', startDate: new Date(), firstDueDate: schedule[0].dueDate, disbursedAt: new Date(), status: 'PAID', installments: { create: schedule.map((item) => ({ ...item, paidAmount: item.total, status: 'PAID' })) } } });
+    const paidProduct = { ...product, cedula: '1-2222-2222', renewalOfLoanId: paidLoan.id };
+    const declined = (await api.post('/api/applications').set('Cookie', outsiderCookie).send(paidProduct).expect(201)).body;
+    await submitIdentity(declined.id, outsiderCookie);
+    await api.post(`/api/applications/${declined.id}/reject`).set('Cookie', adminCookie).send({ reason: 'Historial revisado: no se autoriza esta solicitud.' }).expect(201);
+    assert.equal((await prisma.loan.findUniqueOrThrow({ where: { id: paidLoan.id } })).status, 'PAID');
+    const paidRenewal = (await api.post('/api/applications').set('Cookie', outsiderCookie).send(paidProduct).expect(201)).body;
+    await submitIdentity(paidRenewal.id, outsiderCookie);
+    const paidApproved = (await api.post(`/api/applications/${paidRenewal.id}/approve`).set('Cookie', adminCookie).send(approval).expect(201)).body;
+    const full = (await api.post(`/api/loans/${paidApproved.id}/disburse`).set('Cookie', adminCookie).send({ expectedRenewalPayoff: 0 }).expect(201)).body;
+    assert.equal(full.netDisbursement, 100000);
+    assert.equal((await prisma.loan.findUniqueOrThrow({ where: { id: paidLoan.id } })).status, 'REFINANCED');
+    assert.equal(await prisma.payment.count({ where: { method: 'REFINANCE' } }), 1);
+    async function downloadWorkbook(path: string, cookie: string) {
+      const response = await api.get(path).set('Cookie', cookie).buffer(true).parse((response, callback) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on('end', () => callback(null, Buffer.concat(chunks)));
+      }).expect('Content-Type', /spreadsheetml/).expect(200);
+      const workbook = new Workbook();
+      await workbook.xlsx.load(response.body);
+      return workbook;
+    }
+    const paymentBook = await downloadWorkbook('/api/payments/export', adminCookie);
+    const paymentSheet = paymentBook.getWorksheet('Pagos')!;
+    assert.equal(paymentSheet.getCell('A7').value, 'Recibo');
+    assert.equal(paymentSheet.getCell(paymentSheet.rowCount, 6).value, 80000, 'El total de Excel no debe incluir renovaciones');
+    assert.equal(typeof paymentSheet.getCell('F8').value, 'number');
+    assert.ok(paymentSheet.getCell('B8').value instanceof Date);
+    assert.ok(paymentSheet.getCell('F8').numFmt.includes('₡'));
+    assert.ok(paymentSheet.autoFilter);
+    const emptyBook = await downloadWorkbook('/api/payments/export?search=no-existe-este-recibo', adminCookie);
+    assert.equal(emptyBook.getWorksheet('Pagos')!.getCell('F8').value, 0);
+    const reportBook = await downloadWorkbook('/api/reports/export', adminCookie);
+    assert.deepEqual(reportBook.worksheets.map((sheet) => sheet.name), ['Cartera', 'Morosidad', 'Cobros', 'Comunidades', 'Equipo']);
+    const loanBook = await downloadWorkbook(`/api/loans/${approved.id}/export`, clientCookie);
+    assert.equal(loanBook.getWorksheet('Plan de pagos')!.getCell('A7').value, 'Cuota');
+    await api.get(`/api/loans/${approved.id}/export`).set('Cookie', outsiderCookie).expect(404);
+    await api.get('/api/payments/export').set('Cookie', clerkCookie).expect(403);
+    await api.get('/api/reports/export').set('Cookie', clerkCookie).expect(403);
+    await prisma.user.update({ where: { id: client.id }, data: { name: '=SUM(1,2)' } });
+    const safeBook = await downloadWorkbook('/api/payments/export', adminCookie);
+    assert.equal(safeBook.getWorksheet('Pagos')!.getCell('C8').type, 3, 'Los textos no deben convertirse en fórmulas');
+    const csv = await api.get('/api/payments/export?format=csv').set('Cookie', adminCookie).expect(200);
+    assert.ok(csv.text.includes("'=SUM(1,2)"));
+    const clerk = await prisma.user.findUniqueOrThrow({ where: { email: 'clerk@test.cr' } });
+    await prisma.user.update({ where: { id: clerk.id }, data: { status: 'INACTIVE' } });
+    await api.get('/api/clients').set('Cookie', clerkCookie).expect(401);
+    console.log('OK: renovación, configuración, zona personalizada, ocupación libre y permisos; archivos Excel válidos con formatos y totales, filtros, exportación protegida y CSV seguro.');
+  } finally {
+    if (app) await app.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+main().catch((error) => { console.error(error); process.exitCode = 1; });

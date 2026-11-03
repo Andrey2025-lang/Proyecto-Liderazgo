@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="JyC Préstamos">
+  <rect width="64" height="64" rx="16" fill="#123b2e" />
+  <path d="M41 17v22c0 6-4.5 10-10.5 10-5 0-8.5-2.3-10.5-6.2" fill="none" stroke="#f7f0df" stroke-width="6" stroke-linecap="round" />
+  <circle cx="46" cy="46" r="4.5" fill="#c9a227" />
+</svg>
